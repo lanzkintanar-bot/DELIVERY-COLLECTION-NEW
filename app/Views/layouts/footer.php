@@ -17,11 +17,7 @@ $scriptMap = [
     'customer-profile' => ['assets/customer-profile.js'],
     'attachment-viewer' => ['assets/attachment-viewer.js'],
 ];
-// offline-core.js must run before anything that might call
-// window.mars.offline (including offline-indicator.js right after it), and
-// before feature scripts that opt into it -- defer preserves document
-// order regardless of load order, so putting it first here is what matters.
-$toLoad = ['assets/offline-core.js', 'assets/offline-indicator.js', 'assets/jquery-3.7.1.min.js'];
+$toLoad = ['assets/jquery-3.7.1.min.js'];
 foreach ($pageScripts as $key) {
     if (isset($scriptMap[$key])) {
         $toLoad = array_merge($toLoad, $scriptMap[$key]);
