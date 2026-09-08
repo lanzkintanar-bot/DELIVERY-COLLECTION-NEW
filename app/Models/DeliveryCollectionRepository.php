@@ -374,14 +374,18 @@ class DeliveryCollectionRepository
      * Saves a rider-uploaded deposit slip for one delivery stop (a
      * TripID + CustomerID pair, which may cover several invoices), the same
      * way store-delivery photos are saved: on disk under Uploads/, plus a
-     * binary copy in FileAttachment. Only allowed once every invoice
-     * assigned to that rider for that trip/customer has actually been
-     * delivered (matches the "Deposit Slip" button only being enabled once
-     * the stop's status reads "Delivered") -- re-checked here since the
-     * client-side disabled state is not itself a security boundary.
+     * binary copy in FileAttachment. Only allowed for a JKAS rider once
+     * every invoice assigned to that rider for that trip/customer has been
+     * resolved (delivered OR not received) -- matches the "Deposit Slip"
+     * button's enabled state in delivery/portal.php -- re-checked here since
+     * the client-side disabled state is not itself a security boundary.
      */
     public function saveDepositSlip(string $userId, string $tripId, string $customerId, array $file): void
     {
+        if (!$this->isJkasRider($userId)) {
+            throw new RuntimeException('Deposit slip upload is only available for JKAS riders.');
+        }
+
         $stmt = $this->pdo->prepare("
             SELECT COUNT(*) AS Total,
                    SUM(CASE WHEN I.DeliveredDate IS NOT NULL THEN 1 ELSE 0 END) AS Delivered,
@@ -395,10 +399,11 @@ class DeliveryCollectionRepository
         $total = (int) ($row['Total'] ?? 0);
         $delivered = (int) ($row['Delivered'] ?? 0);
         $notDelivered = (int) ($row['NotDelivered'] ?? 0);
+        $resolved = $delivered + $notDelivered;
 
         if ($total === 0) throw new RuntimeException('This delivery stop was not found or is not assigned to you.');
-        if ($notDelivered > 0 || $delivered < $total) {
-            throw new RuntimeException('A deposit slip can only be uploaded once every invoice for this stop has been delivered.');
+        if ($resolved < $total) {
+            throw new RuntimeException('A deposit slip can only be uploaded once every invoice for this stop has been resolved (delivered or not received).');
         }
 
         $attachRef = 'depositslip_' . $tripId . '_' . $customerId;
@@ -442,7 +447,11 @@ class DeliveryCollectionRepository
                 C.Latitude, C.Longitude,
                 COUNT(*) AS InvoiceCount,
                 SUM(CASE WHEN I.DeliveredDate IS NOT NULL THEN 1 ELSE 0 END) AS DeliveredCount,
-                SUM(CASE WHEN I.NotDeliveredReason IS NOT NULL THEN 1 ELSE 0 END) AS NotDeliveredCount
+                SUM(CASE WHEN I.NotDeliveredReason IS NOT NULL THEN 1 ELSE 0 END) AS NotDeliveredCount,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM FileAttachment FA
+                    WHERE FA.ATTACH_REFID_DTL = CONCAT('depositslip_', I.TripID, '_', I.CustomerID)
+                ) THEN 1 ELSE 0 END AS HasDepositSlip
             FROM TripInvoice I
             INNER JOIN Customers C ON C.CustomerID = I.CustomerID
             WHERE I.TripID IN ({$placeholders})
@@ -489,6 +498,37 @@ class DeliveryCollectionRepository
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 
+    /**
+     * Looks up InvoiceList details for a specific list of invoice numbers in
+     * one round trip (used once every TripInvoice row for a stop has been
+     * confirmed delivered, to pre-fill the "Invoices with outstanding
+     * balance" step instead of querying one invoice at a time).
+     */
+    public function collectionInvoicesByNumbers(string $customerCode, array $invoiceNumbers, string $dbName = ''): array
+    {
+        $invoiceNumbers = array_values(array_unique(array_filter(array_map('trim', $invoiceNumbers), fn($v) => $v !== '')));
+        if (!$invoiceNumbers) return [];
+
+        $placeholders = [];
+        $params = [':customer' => trim($customerCode)];
+        foreach ($invoiceNumbers as $i => $invoiceNo) {
+            $key = ":inv{$i}";
+            $placeholders[] = $key;
+            $params[$key] = $invoiceNo;
+        }
+
+        $sql = "SELECT I.REFID AS InvoiceNo, I.REFID AS DrNo, I.BALANCE AS Balance, I.DELIVERYDATE AS DeliveryDate, I.DEPARTMENT, I.DATABASENAME,
+            CASE WHEN EXISTS (SELECT 1 FROM CollectionSyntaxInvDtl C WHERE C.INVOICENO = I.REFID) THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END AS AlreadyCollected
+            FROM InvoiceList I WHERE I.CUSTOMERID = :customer AND I.REFID IN (" . implode(',', $placeholders) . ')';
+        if ($dbName !== '') {
+            $sql .= ' AND I.DATABASENAME = :dbname';
+            $params[':dbname'] = $dbName;
+        }
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
     public function collectionInvoiceExists(string $invoiceNumber): bool
     {
         $stmt = $this->pdo->prepare('SELECT TOP 1 1 FROM CollectionSyntaxInvDtl WHERE INVOICENO = :invoice');
@@ -503,11 +543,15 @@ class DeliveryCollectionRepository
      * InvoiceList has no due-date column, so the due date is assumed to be
      * standard Net 30 terms (InvoiceDate + 30 days). Update this if the
      * business has a real payment-terms source to read from instead.
+     *
+     * The displayed "Date" column uses DeliveryDate when it is present and
+     * later than InvoiceDate (a late delivery), otherwise it falls back to
+     * InvoiceDate.
      */
     public function agingReceivables(string $customerCode): array
     {
         $stmt = $this->pdo->prepare(
-            "SELECT REFID, INVOICEDATE, SALESMANID, BALANCE
+            "SELECT REFID, INVOICEDATE, DELIVERYDATE, SALESMANID, BALANCE
              FROM InvoiceList
              WHERE CUSTOMERID = :customer AND BALANCE > 0
              ORDER BY INVOICEDATE, REFID"
@@ -521,6 +565,17 @@ class DeliveryCollectionRepository
 
         foreach ($rows as $row) {
             $invoiceDate = new DateTimeImmutable((string) $row['INVOICEDATE']);
+
+            // DeliveryDate can be blank/null, and when a delivery is late it
+            // can also fall after the invoice date. Use DeliveryDate only
+            // when it is present and later than InvoiceDate; otherwise fall
+            // back to InvoiceDate.
+            $deliveryDateRaw = $row['DELIVERYDATE'] ?? null;
+            $deliveryDate = $deliveryDateRaw !== null && trim((string) $deliveryDateRaw) !== ''
+                ? new DateTimeImmutable((string) $deliveryDateRaw)
+                : null;
+            $effectiveDate = ($deliveryDate !== null && $deliveryDate > $invoiceDate) ? $deliveryDate : $invoiceDate;
+
             $dueDate = $invoiceDate->modify('+30 days'); // Net 30 assumption -- see method doc comment.
             $daysPastDue = (int) floor(($today->getTimestamp() - $dueDate->getTimestamp()) / 86400);
             $balance = (float) $row['BALANCE'];
@@ -543,7 +598,7 @@ class DeliveryCollectionRepository
 
             $items[] = [
                 'refid' => (string) $row['REFID'],
-                'date' => $invoiceDate->format('m/d/Y'),
+                'date' => $effectiveDate->format('m/d/Y'),
                 'due_date' => $dueDate->format('m/d/Y'),
                 'salesman' => (string) $row['SALESMANID'],
                 'balance' => $balance,
@@ -574,14 +629,10 @@ class DeliveryCollectionRepository
      */
     public function deliveryRequiresCollection(string $userId, string $customerCode): bool
     {
-        $userId = trim($userId);
         $customerCode = trim($customerCode);
-        if ($userId === '' || $customerCode === '') return false;
+        if (trim($userId) === '' || $customerCode === '') return false;
 
-        $stmt = $this->pdo->prepare('SELECT SType FROM UserList WHERE USERID = :user');
-        $stmt->execute([':user' => $userId]);
-        $sType = $stmt->fetchColumn();
-        $isJkas = is_string($sType) && strcasecmp(trim($sType), 'JKAS') === 0;
+        $isJkas = $this->isJkasRider($userId);
 
         $stmt = $this->pdo->prepare('SELECT SellingType FROM Customers WHERE CustomerID = :customer');
         $stmt->execute([':customer' => $customerCode]);
@@ -589,6 +640,22 @@ class DeliveryCollectionRepository
         $sellingTypeIsNull = $sellingType === false || $sellingType === null || trim((string) $sellingType) === '';
 
         return $isJkas || $sellingTypeIsNull;
+    }
+
+    /**
+     * Whether this rider's UserList.SType is 'JKAS'. This is also the only
+     * rider type allowed to upload a stop's deposit slip -- a distinct rule
+     * from deliveryRequiresCollection() above, which additionally covers
+     * customers with no SellingType set yet.
+     */
+    public function isJkasRider(string $userId): bool
+    {
+        $userId = trim($userId);
+        if ($userId === '') return false;
+        $stmt = $this->pdo->prepare('SELECT SType FROM UserList WHERE USERID = :user');
+        $stmt->execute([':user' => $userId]);
+        $sType = $stmt->fetchColumn();
+        return is_string($sType) && strcasecmp(trim($sType), 'JKAS') === 0;
     }
 
     public function categories()

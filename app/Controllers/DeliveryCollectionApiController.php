@@ -34,6 +34,9 @@ class DeliveryCollectionApiController
                 case 'collection_invoices':
                     $this->collectionInvoices($repository);
                     break;
+                case 'collection_invoices_batch':
+                    $this->collectionInvoicesBatch($repository);
+                    break;
                 case 'aging_receivables':
                     $this->agingReceivables($repository);
                     break;
@@ -301,6 +304,45 @@ class DeliveryCollectionApiController
         $dbName = (string) ($_SESSION['DATABASENAME'] ?? '');
         $items = $alreadyCollected ? [] : $repository->searchCollectionInvoices($customer, $query, $dbName);
         echo json_encode(['success' => true, 'items' => $items, 'already_collected' => $alreadyCollected]);
+    }
+
+    /**
+     * Looks up InvoiceList details for every invoice_no supplied at once
+     * (used right after all TripInvoice rows for a stop are confirmed
+     * delivered, to pre-fill "Invoices with outstanding balance" without
+     * one AJAX round trip per invoice).
+     */
+    private function collectionInvoicesBatch(DeliveryCollectionRepository $repository): void
+    {
+        $customer = trim((string) ($_POST['customer'] ?? ''));
+        if ($customer === '') throw new RuntimeException('Select a customer first.');
+
+        $raw = (string) ($_POST['invoice_numbers'] ?? '[]');
+        $invoiceNumbers = json_decode($raw, true);
+        if (!is_array($invoiceNumbers)) throw new RuntimeException('Invalid invoice list.');
+        $invoiceNumbers = array_values(array_unique(array_filter(array_map('strval', $invoiceNumbers), fn($v) => trim($v) !== '')));
+        if (!$invoiceNumbers) {
+            echo json_encode(['success' => true, 'items' => [], 'not_found' => []]);
+            return;
+        }
+
+        $dbName = (string) ($_SESSION['DATABASENAME'] ?? '');
+        $found = $repository->collectionInvoicesByNumbers($customer, $invoiceNumbers, $dbName);
+
+        // Already-collected invoices must never be offered again, same rule
+        // as the single-invoice search.
+        $items = array_values(array_filter($found, fn($row) => !$row['AlreadyCollected']));
+        $alreadyCollected = array_values(array_filter($found, fn($row) => $row['AlreadyCollected']));
+
+        $foundNumbers = array_map(fn($row) => (string) $row['InvoiceNo'], $found);
+        $notFound = array_values(array_diff($invoiceNumbers, $foundNumbers));
+
+        echo json_encode([
+            'success' => true,
+            'items' => $items,
+            'already_collected' => array_map(fn($row) => (string) $row['InvoiceNo'], $alreadyCollected),
+            'not_found' => $notFound,
+        ]);
     }
 
     private function agingReceivables(DeliveryCollectionRepository $repository): void
